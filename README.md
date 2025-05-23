@@ -1,19 +1,15 @@
-# simple vlm grpo
+# simple grpo
 
-A simple grpo trainer script for vlms. It's basically a rewrite of TRL's GRPOTrainer but simplified. The idea is to drop some things that work ootb in TRL in exchange for extensibility.
+A simple grpo trainer script. It's basically a rewrite of TRL's GRPOTrainer but simplified. The idea is to drop some things that work ootb in TRL in exchange for extensibility.
 
+- works for vlms/llms
 - no accelerate, only torch dist
-- supports fsdp
+- supports fsdp and peft
 - no weighing rewards
 - always scale
 - bpo-style loss
 
-it works with qwen2.5-vl but shouldn't be too hard to port it to other archs.
-
-if you want to use it you should:
-
-1. have a look at config.py and update it according to your needs. it should have ~ the same defaults as TRL now
-2. update data.py to include whichever data you want to use.
+if you want to use it you should have a look at config.py and update it according to your needs. For instance, update the data collator, change config values, etc .It should have ~ the same defaults as TRL now
 
 then:
 
@@ -43,7 +39,7 @@ VLLM_USE_V1=0 CUDA_VISIBLE_DEVICES=0,1... uv run vllm_server.py --model "Qwen/Qw
 CUDA_VISIBLE_DEVICES=4,5... uv run torchrun --nproc_per_node=4 train.py
 ```
 
-optionally, you can enable features with flags. e.g.
+optionally, you can change the config values with flags. e.g.
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5.. uv run torchrun --nproc_per_node=4 train.py --use_fsdp
