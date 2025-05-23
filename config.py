@@ -1,9 +1,40 @@
+import copy
 from dataclasses import dataclass
+from typing import Callable
+
+from qwen_vl_utils import process_vision_info
+
+
+def collate_fn(batch):
+    processed_samples = []
+    for sample in batch:
+        prompt_data = sample["prompt"]
+        processed_prompt = copy.deepcopy(prompt_data)
+        processed_images = []
+        if "images" in sample:
+            image_data = sample["images"]
+            image_index = 0
+            for message in processed_prompt:
+                for content in message["content"]:
+                    if isinstance(content, dict) and content.get("type") == "image":
+                        content["image"] = image_data[image_index]
+                        image_index += 1
+            processed_images, *_ = process_vision_info(processed_prompt)
+        processed_sample = {"prompt": processed_prompt, "images": processed_images}
+        for key, value in sample.items():
+            if key not in ["prompt", "images"]:
+                processed_sample[key] = value
+        processed_samples.append(processed_sample)
+    return processed_samples
 
 
 @dataclass
 class TrainConfig:
-    model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    dataset_id: str = "HuggingFaceH4/rlaif-v_formatted"
+    collate_fn: Callable[[list[dict]], list[dict]] | None = None
+    no_apply_chat_template: bool = False
+    extra_columns: list[str] | None = None
     batch_size: int = 2
     max_completion_len: int = 256
     num_generations: int = 2
@@ -17,6 +48,7 @@ class TrainConfig:
     beta: float = 0.04
     temperature: float = 0.9
     top_k: int = 50
+    use_peft: bool = False
     use_fsdp: bool = False
     bf16: bool = False
     fsdp_bf16: bool = False
@@ -30,3 +62,4 @@ class TrainConfig:
     hub_private: bool = True
     seed: int = 42
     dtype: str = "bfloat16"
+    use_cache: bool = False

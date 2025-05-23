@@ -82,8 +82,11 @@ def llm_worker(
         enable_prefix_caching=args.enable_prefix_caching,
         kv_cache_dtype=args.kv_cache_dtype,
         max_model_len=args.max_model_len,
-        limit_mm_per_prompt={"image": 2},
+        limit_mm_per_prompt={"image": args.image_limit_mm_per_prompt}
+        if args.image_limit_mm_per_prompt
+        else None,
         worker_extension_cls=f"{__name__}.WeightSyncWorkerExtension",
+        seed=42,  # TODO: remove this
     )
     connection.send({"status": "ready"})
     while True:
@@ -123,6 +126,7 @@ def main():
     parser.add_argument("--enforce_eager", type=bool, default=None)
     parser.add_argument("--kv_cache_dtype", type=str, default="auto")
     parser.add_argument("--log_level", type=str, default="info")
+    parser.add_argument("--image_limit_mm_per_prompt", type=int, default=None)
     args = parser.parse_args()
     master_port = get_open_port()
     connections = []
@@ -166,14 +170,15 @@ def main():
     async def generate(request: Request):
         body = await request.json()
         prompts = body.get("prompts")
-        for prompt_dict in prompts:
-            image_data = prompt_dict["multi_modal_data"]["image"]
-            if isinstance(image_data, list):
-                prompt_dict["multi_modal_data"]["image"] = [
-                    base64_to_pil(img) for img in image_data
-                ]
-            else:
-                prompt_dict["multi_modal_data"]["image"] = base64_to_pil(image_data)
+        if isinstance(prompts[0], dict):
+            for prompt_dict in prompts:
+                image_data = prompt_dict["multi_modal_data"]["image"]
+                if isinstance(image_data, list):
+                    prompt_dict["multi_modal_data"]["image"] = [
+                        base64_to_pil(img) for img in image_data
+                    ]
+                else:
+                    prompt_dict["multi_modal_data"]["image"] = base64_to_pil(image_data)
         sampling_params = SamplingParams(
             n=body.get("n", 1),
             repetition_penalty=body.get("repetition_penalty", 1.0),
@@ -187,6 +192,7 @@ def main():
             )
             if body.get("guided_decoding_regex")
             else None,
+            seed=42,  # TODO: remove this
         )
         chunked_prompts = chunk_list(prompts, args.data_parallel_size)
         for connection, prompts in zip(connections, chunked_prompts):

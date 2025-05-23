@@ -1,10 +1,12 @@
 import argparse
+import inspect
 import os
 import random
 import re
 from collections import defaultdict
 from collections.abc import Iterator
 from copy import deepcopy
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -13,15 +15,67 @@ import torch
 import torch.distributed as dist
 import wandb
 from huggingface_hub import HfApi, create_repo
+from peft.tuners.lora import LoraLayer
 from torch import Tensor, nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Sampler
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    PreTrainedModel,
+)
 
 from config import TrainConfig
 from vllm_client import VLLMClient
+
+
+def accepts_kwarg(fn, name: str) -> bool:
+    try:
+        inspect.signature(fn).bind_partial(**{name: None})
+        return True
+    except TypeError:
+        return False
+
+
+def smart_load(model_id: str, **hf_kwargs) -> PreTrainedModel:
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    for arch in cfg.architectures or []:
+        try:
+            cls = getattr(import_module("transformers"), arch)
+            return cls.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **hf_kwargs,
+            )
+        except (AttributeError, ImportError, ValueError):
+            pass
+
+    from transformers import (
+        AutoModel,
+        AutoModelForCausalLM,
+        AutoModelForSeq2SeqLM,
+        AutoModelForVision2Seq,
+    )
+
+    for auto_cls in (
+        AutoModelForCausalLM,
+        AutoModelForSeq2SeqLM,
+        AutoModelForVision2Seq,
+        AutoModel,
+    ):
+        try:
+            return auto_cls.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                **hf_kwargs,
+            )
+        except ValueError:
+            continue
+
+    raise RuntimeError(f"No suitable loader found for model type {cfg.model_type!r}")
 
 
 def init_distributed() -> tuple[int, torch.device]:
@@ -37,20 +91,39 @@ def sync_fsdp_params_to_vllm(
     vllm_client: VLLMClient | None,
     prefix: str = "",
     visited: set[str] | None = None,
+    peft: bool = False,
 ) -> None:
+    LORA_PAT = re.compile(r"\.lora_[AB]\.")
     rank = dist.get_rank()
     if visited is None:
         visited = set()
     for child_name, child_module in module.named_children():
         child_prefix = f"{prefix}.{child_name}" if prefix else child_name
         sync_fsdp_params_to_vllm(
-            child_module, vllm_client, prefix=child_prefix, visited=visited
+            child_module, vllm_client, prefix=child_prefix, visited=visited, peft=peft
         )
     if isinstance(module, FSDP):
         with FSDP.summon_full_params(module, recurse=False, writeback=False):
+            merged = []
+            if peft:
+                for m in module.modules():
+                    if isinstance(m, LoraLayer):
+                        m.merge()
+                        merged.append(m)
             for param_name, param in module.named_parameters():
                 full_name = f"{prefix}.{param_name}" if prefix else param_name
                 subs = ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.")
+                if FSDP:
+                    if LORA_PAT.search(full_name):
+                        continue
+                    subs = (
+                        "base_model.model.",
+                        "base_model.",
+                        "_fsdp_wrapped_module.",
+                        "_checkpoint_wrapped_module.",
+                        ".base_layer",
+                        "modules_to_save.default.",
+                    )
                 for extra in subs:
                     full_name = full_name.replace(extra, "")
                 if full_name in visited:
@@ -58,6 +131,8 @@ def sync_fsdp_params_to_vllm(
                 visited.add(full_name)
                 if rank == 0:
                     vllm_client.update_named_param(full_name, param.data)
+            for m in merged:
+                m.unmerge()
 
 
 def gather(tensor: Tensor) -> Tensor:
@@ -255,10 +330,15 @@ def parse_args() -> TrainConfig:
             for f in cfg.__dataclass_fields__.values()
         }
     )
+    cfg.dtype = getattr(torch, cfg.dtype)
+    if cfg.gradient_checkpoint:
+        cfg.use_cache = False
     if cfg.use_fsdp and dist.get_world_size() == 1:
         raise Exception("FSDP should not be used with just one GPU")
     if cfg.fsdp_bf16 and cfg.use_fsdp:
-        cfg.BF16 = True
+        cfg.bf16 = True
         if cfg.dtype == torch.bfloat16:
             cfg.dtype = torch.float32
+    if cfg.collate_fn is None:
+        cfg.collate_fn = lambda batch: batch
     return cfg

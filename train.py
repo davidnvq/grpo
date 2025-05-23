@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from peft import LoraConfig, get_peft_model
 from torch import Tensor, nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
@@ -14,17 +15,14 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import (
-    AutoProcessor,
-    Qwen2_5_VLForConditionalGeneration,
-    get_cosine_schedule_with_warmup,
-)
+from transformers import AutoProcessor, PreTrainedModel, get_cosine_schedule_with_warmup
 
 from config import TrainConfig
 from data import GRPODataset
 from utils import (
     DistRepeatSampler,
     RepeatSampler,
+    accepts_kwarg,
     create_reference_model,
     gather,
     gather_object,
@@ -35,6 +33,8 @@ from utils import (
     nanmin,
     parse_args,
     save_checkpoint,
+    set_seed,
+    smart_load,
     sync_fsdp_params_to_vllm,
 )
 from vllm_client import VLLMClient
@@ -78,22 +78,27 @@ def score_completions(
 
 
 def get_log_probs(
-    model: FSDP | DDP,
+    model: FSDP | DDP | PreTrainedModel,
     input_ids: Tensor,
     attention_mask: Tensor,
     logits_to_keep: int,
     cfg: TrainConfig,
-    model_kwarg_keys: dict,
     maybe_cast_to_f32: bool = True,
     **model_kwargs,
 ) -> Tensor:
-    if "logits_to_keep" in model_kwarg_keys:
-        model_kwargs.update({"logits_to_keep": logits_to_keep + 1})
+    forward_model = model.module if hasattr(model, "module") else model
+    forward = (
+        forward_model.get_base_model().forward
+        if hasattr(forward_model, "get_base_model")
+        else forward_model.forward
+    )
+    if accepts_kwarg(forward, "logits_to_keep"):
+        model_kwargs["logits_to_keep"] = logits_to_keep + 1
     logits = model(
         input_ids=input_ids, attention_mask=attention_mask, **model_kwargs
     ).logits
     if cfg.bf16 and maybe_cast_to_f32:
-        logits = logits.float()  # return to f32 if using MP
+        logits = logits.float()
     logits = logits[:, :-1, :]
     input_ids = input_ids[:, -logits_to_keep:]
     logits = logits[:, -logits_to_keep:]
@@ -123,7 +128,7 @@ def get_log_probs(
 
 def prepare_inputs(
     batch: list[dict[str, str]],
-    policy_model: FSDP | Qwen2_5_VLForConditionalGeneration,
+    policy_model: FSDP | PreTrainedModel,
     processor: AutoProcessor,
     reward_funcs: list[Callable[[list, list, list], list[float]]],
     vllm_client: VLLMClient | None,
@@ -133,33 +138,56 @@ def prepare_inputs(
 ) -> tuple[dict[str, Tensor], defaultdict[str, list[float]]]:
     prompts = [x["prompt"] for x in batch]
     images = [x["images"] for x in batch if "images" in x]
-    prompts_text = [
-        processor.apply_chat_template(
-            prompt, tokenize=False, add_generation_prompt=True
-        )
-        for prompt in prompts
-    ]
-    prompt_inputs = processor(
-        text=prompts_text.copy(),
-        images=images,
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-        add_special_tokens=False,
-    ).to(device)
+    if len(images) == 0:
+        images = None
+    if cfg.no_apply_chat_template:
+        prompts_text = prompts
+    else:
+        prompts_text = [
+            processor.apply_chat_template(
+                prompt, tokenize=False, add_generation_prompt=True
+            )
+            for prompt in prompts
+        ]
+    if images is None:
+        prompt_inputs = processor(
+            text=prompts_text.copy(),
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        ).to(device)
+    else:
+        prompt_inputs = processor(
+            text=prompts_text.copy(),
+            images=images,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        ).to(device)
     prompt_ids, prompt_mask = (
         prompt_inputs["input_ids"],
         prompt_inputs["attention_mask"],
     )
+    remaining_prompt_inputs = {
+        k: v
+        for k, v in prompt_inputs.items()
+        if k not in ["input_ids", "attention_mask"]
+    }
     update_vllm_client(policy_model, vllm_client, cfg)
     all_images = gather_object(images) if images is not None else None
     all_prompts_text = gather_object(prompts_text)
-    vllm_prompts = [
-        {"multi_modal_data": {"image": image}, "prompt": prompt}
-        for prompt, image in zip(
-            all_prompts_text[:: cfg.num_generations], all_images[:: cfg.num_generations]
-        )
-    ]
+    if images is not None:
+        vllm_prompts = [
+            {"multi_modal_data": {"image": image}, "prompt": prompt}
+            for prompt, image in zip(
+                all_prompts_text[:: cfg.num_generations],
+                all_images[:: cfg.num_generations],
+            )
+        ]
+    else:
+        vllm_prompts = all_prompts_text[:: cfg.num_generations]
     rank = dist.get_rank()
     if rank == 0:
         completion_ids = vllm_client.generate(
@@ -175,10 +203,20 @@ def prepare_inputs(
     process_slice = slice(rank * len(prompts), (rank + 1) * len(prompts))
     completion_ids = completion_ids[process_slice]
     completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+    pad_token_id = (
+        processor.tokenizer.pad_token_id
+        if images is not None
+        else processor.pad_token_id
+    )
+    eos_token_id = (
+        processor.tokenizer.eos_token_id
+        if images is not None
+        else processor.eos_token_id
+    )
     completion_ids = torch.nn.utils.rnn.pad_sequence(
-        completion_ids, batch_first=True, padding_value=processor.tokenizer.pad_token_id
+        completion_ids, batch_first=True, padding_value=pad_token_id
     ).to(device)
-    is_eos = completion_ids == processor.tokenizer.eos_token_id
+    is_eos = completion_ids == eos_token_id
     eos_idx = torch.full(
         (is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device
     )
@@ -217,16 +255,16 @@ def prepare_inputs(
         "completion_ids": completion_ids,
         "completion_mask": completion_mask,
         "advantages": advantages,
+        **remaining_prompt_inputs,
     }, metrics
 
 
 def compute_loss(
     policy_model: FSDP | DDP,
-    ref_model: FSDP | DDP,
+    ref_model: FSDP | PreTrainedModel | None,
     inputs: dict[str, Tensor],
     metrics: defaultdict[str, list[float]],
     cfg: TrainConfig,
-    model_kwarg_keys: dict,
 ) -> tuple[Tensor, defaultdict[str, list[float]]]:
     prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
     completion_ids, completion_mask = (
@@ -236,6 +274,13 @@ def compute_loss(
     input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
     logits_to_keep = completion_ids.size(1)
+    model_kwarg_keys = (
+        inspect.signature(policy_model.module.forward).parameters.keys()
+        if not hasattr(policy_model.module, "get_base_model")
+        else inspect.signature(
+            policy_model.module.get_base_model().forward
+        ).parameters.keys()
+    )
     remaining_kwargs = {k: inputs[k] for k in model_kwarg_keys if k in inputs}
     per_token_logps = get_log_probs(
         policy_model,
@@ -243,20 +288,34 @@ def compute_loss(
         attention_mask,
         logits_to_keep,
         cfg,
-        model_kwarg_keys,
         **remaining_kwargs,
     )
     with torch.no_grad():
-        ref_per_token_logps = get_log_probs(
-            ref_model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            cfg,
-            model_kwarg_keys,
-            maybe_cast_to_f32=False if cfg.fsdp_bf16 and cfg.use_fsdp else True,
-            **remaining_kwargs,
-        )
+        if ref_model is None:
+            ctxt = (
+                policy_model.module.disable_adapter()
+                if cfg.use_peft
+                else policy_model.disable_adapter()
+            )
+            with ctxt:
+                ref_per_token_logps = get_log_probs(
+                    policy_model,
+                    input_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    cfg,
+                    **remaining_kwargs,
+                )
+        else:
+            ref_per_token_logps = get_log_probs(
+                ref_model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                cfg,
+                maybe_cast_to_f32=False if cfg.fsdp_bf16 and cfg.use_fsdp else True,
+                **remaining_kwargs,
+            )
     per_token_kl = (
         torch.exp(ref_per_token_logps - per_token_logps)
         - (ref_per_token_logps - per_token_logps)
@@ -296,23 +355,39 @@ def compute_loss(
 
 
 def update_vllm_client(
-    model: FSDP | Qwen2_5_VLForConditionalGeneration,
-    vllm_client: VLLMClient | None,
-    cfg: TrainConfig,
+    model: FSDP | PreTrainedModel, vllm_client: VLLMClient | None, cfg: TrainConfig
 ) -> None:
     rank = dist.get_rank()
-    if cfg.use_fsdp:
-        sync_fsdp_params_to_vllm(model, vllm_client)
-    else:
-        if rank == 0:
+    if cfg.use_peft:
+        if cfg.use_fsdp:
+            sync_fsdp_params_to_vllm(model, vllm_client, peft=True)
+        else:
+            with torch.autocast(device_type="cuda", dtype=torch.float32):
+                model.merge_adapter()
             for name, param in model.named_parameters():
-                vllm_client.update_named_param(name, param.data)
+                name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                if model.prefix in name:
+                    continue
+                if "original_module" in name:
+                    continue
+                name = name.replace("modules_to_save.default.", "")
+                if rank == 0:
+                    vllm_client.update_named_param(name, param.data)
+            with torch.autocast(device_type="cuda", dtype=torch.float32):
+                model.unmerge_adapter()
+    else:
+        if cfg.use_fsdp:
+            sync_fsdp_params_to_vllm(model, vllm_client)
+        else:
+            if rank == 0:
+                for name, param in model.named_parameters():
+                    vllm_client.update_named_param(name, param.data)
     if rank == 0:
         vllm_client.reset_prefix_cache()
 
 
 def init_dataloader(split: str, cfg: TrainConfig) -> DataLoader:
-    dataset = GRPODataset(split)
+    dataset = GRPODataset(cfg.dataset_id, split, cfg.extra_columns)
     world_size = dist.get_world_size()
     per_dev = cfg.batch_size
     gen_per = cfg.num_generations
@@ -340,7 +415,7 @@ def init_dataloader(split: str, cfg: TrainConfig) -> DataLoader:
         batch_size=per_dev,
         num_workers=world_size,
         pin_memory=True,
-        collate_fn=lambda batch: batch,
+        collate_fn=cfg.collate_fn,
     )
 
 
@@ -350,18 +425,42 @@ def reward_len(completions: list[str], **kwargs) -> list[float]:
 
 def init_models(
     cfg: TrainConfig, local_rank: int, device: torch.device
-) -> tuple[FSDP | DDP, FSDP | DDP, AutoProcessor]:
+) -> tuple[FSDP | DDP, FSDP | DDP | None, AutoProcessor]:
     processor = AutoProcessor.from_pretrained(cfg.model_id, padding_side="left")
-    policy_model_unwrapped = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        cfg.model_id, use_cache=False, torch_dtype=cfg.dtype
-    )
-    if cfg.gradient_checkpoint:
-        if cfg.use_fsdp:
-            policy_model_unwrapped.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        else:
-            policy_model_unwrapped.gradient_checkpointing_enable()
+    if cfg.use_peft:
+        policy_model_unwrapped = smart_load(
+            cfg.model_id, use_cache=cfg.use_cache, torch_dtype=cfg.dtype
+        )
+        lora_config = LoraConfig(
+            lora_alpha=64,
+            lora_dropout=0.05,
+            r=32,
+            bias="none",
+            target_modules=["q_proj", "v_proj"],
+            task_type="CAUSAL_LM",
+        )
+        policy_model_unwrapped = get_peft_model(policy_model_unwrapped, lora_config)
+        if cfg.use_fsdp and cfg.dtype == torch.bfloat16:
+            policy_model_unwrapped.to(torch.bfloat16)
+        policy_model_unwrapped.print_trainable_parameters()
+        if cfg.gradient_checkpoint:
+            if cfg.use_fsdp:
+                policy_model_unwrapped.base_model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            else:
+                policy_model_unwrapped.base_model.gradient_checkpointing_enable()
+    else:
+        policy_model_unwrapped = smart_load(
+            cfg.model_id, use_cache=cfg.use_cache, torch_dtype=cfg.dtype
+        )
+        if cfg.gradient_checkpoint:
+            if cfg.use_fsdp:
+                policy_model_unwrapped.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            else:
+                policy_model_unwrapped.gradient_checkpointing_enable()
     if cfg.gradient_checkpoint:
         policy_model_unwrapped.enable_input_require_grads()
     if cfg.use_fsdp:
@@ -396,8 +495,8 @@ def init_models(
         )
     policy_model.train()
     if cfg.use_fsdp:
-        ref_model_unwrapped = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            cfg.model_id, use_cache=False, torch_dtype=cfg.dtype
+        ref_model_unwrapped = smart_load(
+            cfg.model_id, use_cache=cfg.use_cache, torch_dtype=cfg.dtype
         )
         ref_model = FSDP(
             ref_model_unwrapped,
@@ -408,6 +507,8 @@ def init_models(
             sync_module_states=True,
         )
         ref_model.eval()
+    elif cfg.use_peft:
+        ref_model = None
     else:
         ref_model_copy = create_reference_model(policy_model_unwrapped)
         ref_model = ref_model_copy.to(device)
@@ -416,17 +517,13 @@ def init_models(
 
 
 def train(cfg: TrainConfig, local_rank: int, device: torch.device) -> None:
+    set_seed(cfg.seed)
     rank = dist.get_rank()
     metrics = defaultdict(list)
     if cfg.use_wandb and rank == 0:
         init_wandb()
     reward_funcs = [reward_len]
     policy_model, ref_model, processor = init_models(cfg, local_rank, device)
-    model_kwarg_keys = (
-        inspect.signature(policy_model.forward).parameters.keys()
-        if not hasattr(policy_model, "get_base_model")
-        else inspect.signature(policy_model.get_base_model().forward).parameters.keys()
-    )
     dataloader = init_dataloader("train", cfg)
     optimizer = AdamW(
         [p for _, p in policy_model.named_parameters() if p.requires_grad],
@@ -463,7 +560,7 @@ def train(cfg: TrainConfig, local_rank: int, device: torch.device) -> None:
                     device,
                 )
                 loss, metrics = compute_loss(
-                    policy_model, ref_model, inputs, metrics, cfg, model_kwarg_keys
+                    policy_model, ref_model, inputs, metrics, cfg
                 )
             loss.backward()
             metrics["loss"].append(round(gather(loss).mean().item(), 4))

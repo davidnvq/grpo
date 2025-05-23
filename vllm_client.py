@@ -56,7 +56,7 @@ class VLLMClient:
 
     def generate(
         self,
-        prompts: list[dict],
+        prompts: list[str] | list[dict],
         n: int = 1,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -67,14 +67,15 @@ class VLLMClient:
         guided_decoding_regex: Optional[str] = None,
     ) -> list[list[str]]:
         url = f"http://{self.host}:{self.server_port}/generate/"
-        for prompt_dict in prompts:
-            image_data = prompt_dict["multi_modal_data"]["image"]
-            if isinstance(image_data, list):
-                prompt_dict["multi_modal_data"]["image"] = [
-                    pil_to_base64(img) for img in image_data
-                ]
-            else:
-                prompt_dict["multi_modal_data"]["image"] = pil_to_base64(image_data)
+        if isinstance(prompts[0], dict):
+            for prompt_dict in prompts:
+                image_data = prompt_dict["multi_modal_data"]["image"]
+                if isinstance(image_data, list):
+                    prompt_dict["multi_modal_data"]["image"] = [
+                        pil_to_base64(img) for img in image_data
+                    ]
+                else:
+                    prompt_dict["multi_modal_data"]["image"] = pil_to_base64(image_data)
         response = self.session.post(
             url,
             json={

@@ -51,6 +51,4 @@ CUDA_VISIBLE_DEVICES=4,5.. uv run torchrun --nproc_per_node=4 train.py --use_fsd
 
 ## todo:
 
-- make it more arch-agnostic
-- use a data-collator instead of preprocessing data at init
 - impl two-sided clipping: https://github.com/huggingface/trl/commit/05bc43e960396581e458195b8388efe6b82cae1f
