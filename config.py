@@ -30,7 +30,7 @@ def collate_fn(batch):
 
 @dataclass
 class TrainConfig:
-    model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
     dataset_id: str = "HuggingFaceH4/rlaif-v_formatted"
     collate_fn: Callable[[list[dict]], list[dict]] | None = None
     no_apply_chat_template: bool = False
