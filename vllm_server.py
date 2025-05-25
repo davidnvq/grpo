@@ -86,7 +86,6 @@ def llm_worker(
         if args.image_limit_mm_per_prompt
         else None,
         worker_extension_cls=f"{__name__}.WeightSyncWorkerExtension",
-        seed=42,  # TODO: remove this
     )
     connection.send({"status": "ready"})
     while True:
@@ -192,7 +191,6 @@ def main():
             )
             if body.get("guided_decoding_regex")
             else None,
-            seed=42,  # TODO: remove this
         )
         chunked_prompts = chunk_list(prompts, args.data_parallel_size)
         for connection, prompts in zip(connections, chunked_prompts):
