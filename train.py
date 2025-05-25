@@ -46,6 +46,7 @@ def score_completions(
     completion_ids_list: list[int],
     reward_funcs: list[Callable[[list, list, list], list[float]]],
     device: torch.device,
+    cfg: TrainConfig,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     output_reward_func = [
         torch.tensor(
@@ -232,7 +233,7 @@ def prepare_inputs(
         for row, mask_row in zip(completion_ids, completion_mask)
     ]
     advantages, rewards, rewards_per_func, std_grouped_rewards = score_completions(
-        prompts, completion_texts, completion_ids_list, reward_funcs, device
+        prompts, completion_texts, completion_ids_list, reward_funcs, device, cfg
     )
     metrics["num_tokens"] = [
         gather(attention_mask.sum()).sum().item()
