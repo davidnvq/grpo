@@ -291,21 +291,6 @@ class RepeatSampler(Sampler):
         return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-    os.environ["ASCEND_LAUNCH_BLOCKING"] = "1"
-    os.environ["HCCL_DETERMINISTIC"] = "1"
-    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
-    torch.use_deterministic_algorithms(True, warn_only=False)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser()
     cfg = TrainConfig()
