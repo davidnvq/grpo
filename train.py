@@ -390,12 +390,10 @@ def init_dataloader(split: str, cfg: TrainConfig) -> DataLoader:
     dataset = GRPODataset(cfg.dataset_id, split, cfg.extra_columns)
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    per_dev = cfg.batch_size
-    gen_per = cfg.num_generations
     sampler = RepeatSampler(
         data_source=dataset,
-        mini_repeat_count=gen_per,
-        batch_size=(world_size * per_dev) // gen_per,
+        mini_repeat_count=cfg.num_generations,
+        batch_size=(world_size * cfg.batch_size) // cfg.num_generations,
         repeat_count=1,
         shuffle=True,
         seed=cfg.seed,
