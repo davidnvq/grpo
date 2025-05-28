@@ -14,15 +14,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoProcessor, PreTrainedModel, get_cosine_schedule_with_warmup
 
 from config import TrainConfig
 from data import GRPODataset
 from utils import (
-    DistRepeatSampler,
     RepeatSampler,
     accepts_kwarg,
+    build_batch_sampler,
     create_reference_model,
     gather,
     gather_object,
@@ -33,6 +32,7 @@ from utils import (
     nanmin,
     parse_args,
     save_checkpoint,
+    set_seed,
     smart_load,
     sync_fsdp_params_to_vllm,
 )
@@ -137,6 +137,7 @@ def prepare_inputs(
     device: torch.device,
 ) -> tuple[dict[str, Tensor], defaultdict[str, list[float]]]:
     prompts = [x["prompt"] for x in batch]
+    # print(f"rank {dist.get_rank()} :{prompts}")
     images = [x["images"] for x in batch if "images" in x]
     if len(images) == 0:
         images = None
@@ -389,33 +390,29 @@ def update_vllm_client(
 def init_dataloader(split: str, cfg: TrainConfig) -> DataLoader:
     dataset = GRPODataset(cfg.dataset_id, split, cfg.extra_columns)
     world_size = dist.get_world_size()
+    rank = dist.get_rank()
     per_dev = cfg.batch_size
     gen_per = cfg.num_generations
-    if gen_per > per_dev and (world_size * per_dev) % gen_per == 0:
-        sampler = RepeatSampler(
-            data_source=dataset,
-            mini_repeat_count=per_dev,
-            batch_size=world_size,
-            repeat_count=1,
-            shuffle=True,
-            seed=cfg.seed,
-        )
-    else:
-        base_sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=dist.get_rank(),
-            shuffle=True,
-            seed=cfg.seed,
-        )
-        sampler = DistRepeatSampler(base_sampler=base_sampler, repeat_count=gen_per)
-    return DataLoader(
-        dataset,
+    sampler = RepeatSampler(
+        data_source=dataset,
+        mini_repeat_count=gen_per,
+        batch_size=(world_size * per_dev) // gen_per,
+        repeat_count=1,
+        shuffle=True,
+        seed=cfg.seed,
+    )
+    batch_sampler = build_batch_sampler(
         sampler=sampler,
-        batch_size=per_dev,
-        num_workers=world_size,
-        pin_memory=True,
+        batch_size=cfg.batch_size,
+        num_replicas=world_size,
+        rank=rank,
+    )
+    return DataLoader(
+        dataset=dataset,
+        batch_sampler=batch_sampler,
         collate_fn=cfg.collate_fn,
+        num_workers=0,
+        pin_memory=True,
     )
 
 
@@ -517,6 +514,7 @@ def init_models(
 
 
 def train(cfg: TrainConfig, local_rank: int, device: torch.device) -> None:
+    set_seed(cfg.seed)
     rank = dist.get_rank()
     metrics = defaultdict(list)
     if cfg.use_wandb and rank == 0:

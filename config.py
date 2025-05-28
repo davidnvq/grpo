@@ -61,5 +61,5 @@ class TrainConfig:
     hub_repo_id: str = "YOUR_HUB_REPO_ID"
     hub_private: bool = True
     seed: int = 42
-    dtype: str = "bfloat16"
+    dtype: str = "float32"
     use_cache: bool = False

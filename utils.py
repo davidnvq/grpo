@@ -4,7 +4,6 @@ import os
 import random
 import re
 from collections import defaultdict
-from collections.abc import Iterator
 from copy import deepcopy
 from importlib import import_module
 from pathlib import Path
@@ -13,14 +12,13 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
 from huggingface_hub import HfApi, create_repo
 from peft.tuners.lora import LoraLayer
 from torch import Tensor, nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Sampler
+from torch.utils.data import BatchSampler, Sampler
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -28,6 +26,7 @@ from transformers import (
     PreTrainedModel,
 )
 
+import wandb
 from config import TrainConfig
 from vllm_client import VLLMClient
 
@@ -229,22 +228,84 @@ def create_reference_model(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
     return ref_model.eval()
 
 
-class DistRepeatSampler(Sampler[int]):
-    def __init__(self, base_sampler: Sampler[int], repeat_count: int):
-        if repeat_count <= 0:
-            raise ValueError("repeat_count must be positive")
-        self.base_sampler = base_sampler
-        self.repeat_count = repeat_count
-        if hasattr(base_sampler, "set_epoch") and callable(base_sampler.set_epoch):
-            self.set_epoch = base_sampler.set_epoch
+def build_batch_sampler(
+    sampler: Sampler,
+    batch_size: int,
+    num_replicas: int,
+    rank: int,
+    drop_last: bool = False,
+) -> Sampler:
+    batch_sampler = BatchSampler(
+        sampler=sampler, batch_size=batch_size, drop_last=drop_last
+    )
+    dist_batch_sampler = DistBatchSampler(
+        batch_sampler=batch_sampler,
+        num_replicas=num_replicas,
+        rank=rank,
+        drop_last=drop_last,
+    )
+    return dist_batch_sampler
 
-    def __iter__(self) -> Iterator[int]:
-        for index in self.base_sampler:
-            for _ in range(self.repeat_count):
-                yield index
 
-    def __len__(self) -> int:
-        return len(self.base_sampler) * self.repeat_count
+class DistBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        batch_sampler: BatchSampler,
+        num_replicas: int,
+        rank: int,
+        drop_last: bool = False,
+    ):
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                f"Invalid rank {rank}, rank should be in [0, {num_replicas - 1}]"
+            )
+        self.batch_sampler = batch_sampler
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.drop_last = drop_last
+        self.epoch = 0
+        if self.drop_last:
+            self.num_samples = len(self.batch_sampler) // self.num_replicas
+        else:
+            self.num_samples = (
+                len(self.batch_sampler) + self.num_replicas - 1
+            ) // self.num_replicas
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        if hasattr(self.batch_sampler.sampler, "set_epoch"):
+            self.batch_sampler.sampler.set_epoch(self.epoch)
+        elif (
+            hasattr(self.batch_sampler.sampler, "generator")
+            and hasattr(self.batch_sampler.sampler, "seed")
+            and self.batch_sampler.sampler.generator is not None
+        ):
+            self.batch_sampler.sampler.generator.manual_seed(
+                self.batch_sampler.sampler.seed + self.epoch
+            )
+        idx = 0
+        for i, batch in enumerate(self.batch_sampler):
+            if i % self.num_replicas == self.rank:
+                yield batch
+                idx += 1
+            if self.drop_last and idx >= self.num_samples:
+                break
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+        if hasattr(self.batch_sampler.sampler, "set_epoch"):
+            self.batch_sampler.sampler.set_epoch(epoch)
+        elif (
+            hasattr(self.batch_sampler.sampler, "generator")
+            and hasattr(self.batch_sampler.sampler, "seed")
+            and self.batch_sampler.sampler.generator is not None
+        ):
+            self.batch_sampler.sampler.generator.manual_seed(
+                self.batch_sampler.sampler.seed + epoch
+            )
 
 
 class RepeatSampler(Sampler):
@@ -291,6 +352,21 @@ class RepeatSampler(Sampler):
         return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ["ASCEND_LAUNCH_BLOCKING"] = "1"
+    os.environ["HCCL_DETERMINISTIC"] = "1"
+    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser()
     cfg = TrainConfig()
@@ -315,10 +391,16 @@ def parse_args() -> TrainConfig:
             for f in cfg.__dataclass_fields__.values()
         }
     )
+    world_size = dist.get_world_size()
+    assert cfg.num_generations in [
+        n_gen
+        for n_gen in range(2, (world_size * cfg.batch_size) + 1)
+        if (world_size * cfg.batch_size) % n_gen == 0
+    ]
     cfg.dtype = getattr(torch, cfg.dtype)
     if cfg.gradient_checkpoint:
         cfg.use_cache = False
-    if cfg.use_fsdp and dist.get_world_size() == 1:
+    if cfg.use_fsdp and world_size == 1:
         raise Exception("FSDP should not be used with just one GPU")
     if cfg.fsdp_bf16 and cfg.use_fsdp:
         cfg.bf16 = True
