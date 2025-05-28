@@ -32,7 +32,6 @@ from utils import (
     nanmin,
     parse_args,
     save_checkpoint,
-    set_seed,
     smart_load,
     sync_fsdp_params_to_vllm,
 )
@@ -514,7 +513,6 @@ def init_models(
 
 
 def train(cfg: TrainConfig, local_rank: int, device: torch.device) -> None:
-    set_seed(cfg.seed)
     rank = dist.get_rank()
     metrics = defaultdict(list)
     if cfg.use_wandb and rank == 0:
