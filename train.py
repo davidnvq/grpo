@@ -136,7 +136,6 @@ def prepare_inputs(
     device: torch.device,
 ) -> tuple[dict[str, Tensor], defaultdict[str, list[float]]]:
     prompts = [x["prompt"] for x in batch]
-    # print(f"rank {dist.get_rank()} :{prompts}")
     images = [x["images"] for x in batch if "images" in x]
     if len(images) == 0:
         images = None
