@@ -18,7 +18,12 @@ then:
 ```bash
 uv sync
 
-# uv pip install flash-attn --no-build-isolation
+# uv pip install flash-attn --no-build-isolation 
+# ^ flash_attn version 2.8.2 DOESN'T WORK!!!
+
+# check -D_GLIBCXX_USE_CXX11_ABI in pytorch
+# import torch; print(torch.__config__.show())
+# Go to release page, download the compatible version
 uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 ```
 
