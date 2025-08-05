@@ -30,7 +30,7 @@ def collate_fn(batch):
 
 @dataclass
 class TrainConfig:
-    model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     dataset_id: str = "HuggingFaceH4/rlaif-v_formatted"
     collate_fn: Callable[[list[dict]], list[dict]] | None = None
     no_apply_chat_template: bool = False
@@ -48,11 +48,11 @@ class TrainConfig:
     beta: float = 0.04
     temperature: float = 0.9
     top_k: int = 50
-    use_peft: bool = False
+    use_peft: bool = True
     use_fsdp: bool = False
-    bf16: bool = False
-    fsdp_bf16: bool = False
-    gradient_checkpoint: bool = False
+    bf16: bool = True
+    fsdp_bf16: bool = True
+    gradient_checkpoint: bool = True
     log_steps: int = 1
     save_steps: int = 5
     use_wandb: bool = False
@@ -61,5 +61,5 @@ class TrainConfig:
     hub_repo_id: str = "YOUR_HUB_REPO_ID"
     hub_private: bool = True
     seed: int = 42
-    dtype: str = "float32"
+    dtype: str = "bfloat16"
     use_cache: bool = False

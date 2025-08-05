@@ -14,4 +14,9 @@ dependencies = [
     "uvicorn>=0.34.0",
     "vllm>=0.8.3",
     "wandb>=0.19.11",
+    "peft",
+    "ipython",
+    "jupyter",
+    "ipykernel",
+    "rich",
 ]
