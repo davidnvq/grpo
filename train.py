@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 
 import torch
+import transformers
 import torch.distributed as dist
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
@@ -30,7 +31,6 @@ from utils import (
     log_wandb,
     nanmax,
     nanmin,
-    parse_args,
     save_checkpoint,
     smart_load,
     sync_fsdp_params_to_vllm,
@@ -455,17 +455,23 @@ def train(cfg: TrainConfig, local_rank: int, device: torch.device) -> None:
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
+
     num_training_steps = cfg.num_epochs * len(dataloader)
     num_warmup_steps = int(num_training_steps * cfg.warmup_ratio)
+
     scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps,
     )
+
     vllm_client = VLLMClient(connection_timeout=120.0) if rank == 0 else None
+
     if rank == 0:
         vllm_client.init_communicator()
+
     dist.barrier()
+
     for epoch in range(cfg.num_epochs):
         for step, batch in enumerate(dataloader):
             policy_model.train()
@@ -514,5 +520,5 @@ def train(cfg: TrainConfig, local_rank: int, device: torch.device) -> None:
 
 if __name__ == "__main__":
     local_rank, device = init_distributed()
-    cfg = parse_args()
+    cfg = transformers.HfArgumentParser((TrainConfig)).parse_args_into_dataclasses()[0]
     train(cfg, local_rank, device)

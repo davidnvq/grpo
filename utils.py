@@ -19,15 +19,9 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import BatchSampler, Sampler
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoProcessor,
-    PreTrainedModel,
-)
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, PreTrainedModel
 
 import wandb
-from config import TrainConfig
 from vllm_client import VLLMClient
 
 
@@ -60,10 +54,10 @@ def smart_load(model_id: str, **hf_kwargs) -> PreTrainedModel:
     )
 
     for auto_cls in (
-        AutoModelForCausalLM,
-        AutoModelForSeq2SeqLM,
-        AutoModelForVision2Seq,
-        AutoModel,
+            AutoModelForCausalLM,
+            AutoModelForSeq2SeqLM,
+            AutoModelForVision2Seq,
+            AutoModel,
     ):
         try:
             return auto_cls.from_pretrained(
@@ -98,9 +92,7 @@ def sync_fsdp_params_to_vllm(
         visited = set()
     for child_name, child_module in module.named_children():
         child_prefix = f"{prefix}.{child_name}" if prefix else child_name
-        sync_fsdp_params_to_vllm(
-            child_module, vllm_client, prefix=child_prefix, visited=visited, peft=peft
-        )
+        sync_fsdp_params_to_vllm(child_module, vllm_client, prefix=child_prefix, visited=visited, peft=peft)
     if isinstance(module, FSDP):
         with FSDP.summon_full_params(module, recurse=False, writeback=False):
             merged = []
@@ -163,9 +155,7 @@ def save_checkpoint(
         output_dir.mkdir(parents=True, exist_ok=True)
         processor.save_pretrained(output_dir)
         model.config.save_pretrained(output_dir)
-    opts = StateDictOptions(
-        full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True
-    )
+    opts = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
     state_dict, _ = get_state_dict(model, {}, options=opts)
     if rank == 0:
         model.save_pretrained(output_dir, state_dict=state_dict)
@@ -183,9 +173,7 @@ def _push_folder_to_hub(folder: Path, repo_id: str, private: bool, commit_messag
     api = HfApi()
     if not api.repo_exists(repo_id):
         create_repo(repo_id, private=private, exist_ok=True)
-    api.upload_folder(
-        folder_path=str(folder), repo_id=repo_id, commit_message=commit_message
-    )
+    api.upload_folder(folder_path=str(folder), repo_id=repo_id, commit_message=commit_message)
 
 
 def init_wandb(model_id: str, wandb_project: str) -> None:
@@ -235,9 +223,7 @@ def build_batch_sampler(
     rank: int,
     drop_last: bool = False,
 ) -> Sampler:
-    batch_sampler = BatchSampler(
-        sampler=sampler, batch_size=batch_size, drop_last=drop_last
-    )
+    batch_sampler = BatchSampler(sampler=sampler, batch_size=batch_size, drop_last=drop_last)
     dist_batch_sampler = DistBatchSampler(
         batch_sampler=batch_sampler,
         num_replicas=num_replicas,
@@ -248,6 +234,7 @@ def build_batch_sampler(
 
 
 class DistBatchSampler(Sampler[list[int]]):
+
     def __init__(
         self,
         batch_sampler: BatchSampler,
@@ -256,9 +243,7 @@ class DistBatchSampler(Sampler[list[int]]):
         drop_last: bool = False,
     ):
         if rank >= num_replicas or rank < 0:
-            raise ValueError(
-                f"Invalid rank {rank}, rank should be in [0, {num_replicas - 1}]"
-            )
+            raise ValueError(f"Invalid rank {rank}, rank should be in [0, {num_replicas - 1}]")
         self.batch_sampler = batch_sampler
         self.num_replicas = num_replicas
         self.rank = rank
@@ -267,22 +252,15 @@ class DistBatchSampler(Sampler[list[int]]):
         if self.drop_last:
             self.num_samples = len(self.batch_sampler) // self.num_replicas
         else:
-            self.num_samples = (
-                len(self.batch_sampler) + self.num_replicas - 1
-            ) // self.num_replicas
+            self.num_samples = (len(self.batch_sampler) + self.num_replicas - 1) // self.num_replicas
         self.total_size = self.num_samples * self.num_replicas
 
     def __iter__(self):
         if hasattr(self.batch_sampler.sampler, "set_epoch"):
             self.batch_sampler.sampler.set_epoch(self.epoch)
-        elif (
-            hasattr(self.batch_sampler.sampler, "generator")
-            and hasattr(self.batch_sampler.sampler, "seed")
-            and self.batch_sampler.sampler.generator is not None
-        ):
-            self.batch_sampler.sampler.generator.manual_seed(
-                self.batch_sampler.sampler.seed + self.epoch
-            )
+        elif (hasattr(self.batch_sampler.sampler, "generator") and hasattr(self.batch_sampler.sampler, "seed") and
+              self.batch_sampler.sampler.generator is not None):
+            self.batch_sampler.sampler.generator.manual_seed(self.batch_sampler.sampler.seed + self.epoch)
         idx = 0
         for i, batch in enumerate(self.batch_sampler):
             if i % self.num_replicas == self.rank:
@@ -298,17 +276,13 @@ class DistBatchSampler(Sampler[list[int]]):
         self.epoch = epoch
         if hasattr(self.batch_sampler.sampler, "set_epoch"):
             self.batch_sampler.sampler.set_epoch(epoch)
-        elif (
-            hasattr(self.batch_sampler.sampler, "generator")
-            and hasattr(self.batch_sampler.sampler, "seed")
-            and self.batch_sampler.sampler.generator is not None
-        ):
-            self.batch_sampler.sampler.generator.manual_seed(
-                self.batch_sampler.sampler.seed + epoch
-            )
+        elif (hasattr(self.batch_sampler.sampler, "generator") and hasattr(self.batch_sampler.sampler, "seed") and
+              self.batch_sampler.sampler.generator is not None):
+            self.batch_sampler.sampler.generator.manual_seed(self.batch_sampler.sampler.seed + epoch)
 
 
 class RepeatSampler(Sampler):
+
     def __init__(
         self,
         data_source,
@@ -332,15 +306,10 @@ class RepeatSampler(Sampler):
 
     def __iter__(self):
         if self.shuffle:
-            indexes = torch.randperm(
-                self.num_samples, generator=self.generator
-            ).tolist()
+            indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
         else:
             indexes = list(range(self.num_samples))
-        indexes = [
-            indexes[i : i + self.batch_size]
-            for i in range(0, len(indexes), self.batch_size)
-        ]
+        indexes = [indexes[i:i + self.batch_size] for i in range(0, len(indexes), self.batch_size)]
         indexes = [chunk for chunk in indexes if len(chunk) == self.batch_size]
         for chunk in indexes:
             for _ in range(self.repeat_count):
@@ -365,47 +334,3 @@ def set_seed(seed: int) -> None:
     torch.use_deterministic_algorithms(True, warn_only=False)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser()
-    cfg = TrainConfig()
-    for field in cfg.__dataclass_fields__.values():
-        name = field.name.lower()
-        default = getattr(cfg, field.name)
-        t = type(default)
-        if t is bool:
-            parser.add_argument(
-                f"--{name}",
-                action="store_true" if not default else "store_false",
-                help=f"(default: {default})",
-            )
-        else:
-            parser.add_argument(
-                f"--{name}", type=t, default=default, help=f"(default: {default})"
-            )
-    args = parser.parse_args()
-    cfg = TrainConfig(
-        **{
-            f.name: getattr(args, f.name.lower())
-            for f in cfg.__dataclass_fields__.values()
-        }
-    )
-    world_size = dist.get_world_size()
-    assert cfg.num_generations in [
-        n_gen
-        for n_gen in range(2, (world_size * cfg.batch_size) + 1)
-        if (world_size * cfg.batch_size) % n_gen == 0
-    ]
-    cfg.dtype = getattr(torch, cfg.dtype)
-    if cfg.gradient_checkpoint:
-        cfg.use_cache = False
-    if cfg.use_fsdp and world_size == 1:
-        raise Exception("FSDP should not be used with just one GPU")
-    if cfg.fsdp_bf16 and cfg.use_fsdp:
-        cfg.bf16 = True
-        if cfg.dtype == torch.bfloat16:
-            cfg.dtype = torch.float32
-    if cfg.collate_fn is None:
-        cfg.collate_fn = lambda batch: batch
-    return cfg
